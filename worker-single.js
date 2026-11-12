@@ -1,4 +1,4 @@
-// Yanju alternatives server, single file for pasting into the Cloudflare dashboard.
+// Yanju alternatives server, single file for pasting or uploading.
 // Needs: a KV binding named ALT_KV (recommended) and a secret named APISH_KEY.
 // ===== core.js =====
 // Pure helpers: turning raw AlternativeTo data into simple, safe recommendations.
@@ -229,8 +229,9 @@ async function lookupPricing(official, f = fetch, now = new Date()) {
       if (!robotsAllows(robots, p)) return Object.assign(base, { status: "blocked" });
       let page; try { page = await getText(origin + p, f); } catch (e) { continue; }
       if (!page.ok) continue;
-      base.pricingUrl = page.url;
       const plans = extractPlans(page.text);
+      // Only a page where a price was really read counts as the pricing page. A guessed address such as /pricing
+      // can be something else entirely (on some sites it is a user's profile), so it is never shown otherwise.
       if (plans.length) return { status: "verified", pricingUrl: page.url, plans, checkedAt, region: plans.some(x => x.currency === "NGN") ? "NG" : "international" };
       return base; // page exists but its prices cannot be read reliably
     }
@@ -238,17 +239,106 @@ async function lookupPricing(official, f = fetch, now = new Date()) {
   return base;
 }
 
+// ===== availability.js =====
+// Checks whether a product's own website shows it is offered in a country. Three answers only:
+//   available   = the official site shows country-specific evidence (a local price or a country page)
+//   unavailable = the official site says it is not offered there (or answers "unavailable for legal reasons")
+//   unverified  = anything else. Being able to open a website is never treated as proof it can be bought there.
+// The check runs from the same Cloudflare location that serves the visitor, so it sees roughly what they would see.
+
+const SYMBOLS = { NG: ["\u20A6", "NGN"], GH: ["GH\u20B5", "GHS"], KE: ["KSh", "KES"], ZA: ["ZAR"], GB: ["\u00A3", "GBP"], IN: ["\u20B9", "INR"], EG: ["EGP"], AU: ["AUD"], CA: ["CAD"] };
+
+function countryName(cc) {
+  try { return new Intl.DisplayNames(["en"], { type: "region" }).of(cc) || cc; } catch (e) { return cc; }
+}
+
+const BLOCK = [
+  /not\s+(?:currently\s+|yet\s+)?available\s+(?:in|for|to)\s+(?:your|this)\s+(?:country|region|location|area)/i,
+  /isn['\u2019]?t\s+(?:currently\s+|yet\s+)?available\s+(?:in|for|to)\s+(?:your|this)\s+(?:country|region|location|area)/i,
+  /unavailable\s+in\s+your\s+(?:country|region|location)/i,
+  /(?:sorry|unfortunately)[^.]{0,40}not\s+available\s+in\s+your/i
+];
+function geoBlocked(text, name) {
+  if (BLOCK.some(r => r.test(text))) return true;
+  return !!name && new RegExp("not\\s+(?:yet\\s+|currently\\s+)?available\\s+in\\s+" + name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i").test(text);
+}
+
+function visibleText(html) {
+  return String(html || "").replace(/<script[\s\S]*?<\/script>|<style[\s\S]*?<\/style>|<!--[\s\S]*?-->/gi, " ")
+    .replace(/<[^>]+>/g, " ").replace(/&nbsp;|&#160;/g, " ").replace(/&#8217;|&rsquo;/g, "\u2019").replace(/\s+/g, " ");
+}
+
+// Evidence that the product has a version for this country: a country page address, or prices in the local currency.
+function localEvidence(url, text, cc) {
+  const lc = cc.toLowerCase();
+  try {
+    const u = new URL(url), seg = u.pathname.toLowerCase().split("/").filter(Boolean)[0] || "", host = u.hostname.toLowerCase();
+    if (seg === lc || seg === "en-" + lc || seg === lc + "-en") return "country-page";
+    if (host.startsWith(lc + ".") || host.endsWith("." + lc)) return "country-page";
+  } catch (e) { /* ignore */ }
+  for (const s of SYMBOLS[cc] || []) {
+    const sym = s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    if (new RegExp((/^[A-Z]{3}$/.test(s) ? "\\b" : "") + sym + "\\s?\\d").test(text)) return "local-price";
+  }
+  return null;
+}
+
+async function get(url, f) {
+  try {
+    const r = await f(url, { headers: { "user-agent": UA, accept: "text/html,*/*;q=0.5", "accept-language": "en" }, redirect: "follow", signal: AbortSignal.timeout(6000) });
+    const type = r.headers.get("content-type") || "";
+    return { status: r.status, url: r.url || url, text: !type || /html|text/i.test(type) ? (await r.text()).slice(0, 600000) : "" };
+  } catch (e) { return null; }
+}
+
+async function probeAvailability(site, cc, f = fetch, now = new Date()) {
+  const checkedAt = now.toISOString().slice(0, 10), out = { state: "unverified", checkedAt, evidence: null };
+  let origin; try { origin = new URL(site).origin; } catch (e) { return out; }
+  const robots = await get(origin + "/robots.txt", f);
+  const rtxt = robots && robots.status === 200 ? robots.text : "";
+  const reqs = [];
+  if (robotsAllows(rtxt, "/")) reqs.push(get(origin + "/", f));
+  if (robotsAllows(rtxt, "/pricing")) reqs.push(get(origin + "/pricing", f));
+  const pages = (await Promise.all(reqs)).filter(Boolean);
+  if (!pages.length) return Object.assign(out, { error: true });
+  if (pages.some(p => p.status === 451)) return { state: "unavailable", checkedAt, evidence: "legal-block" };
+  const name = countryName(cc);
+  for (const p of pages) if (geoBlocked(visibleText(p.text), name)) return { state: "unavailable", checkedAt, evidence: "notice" };
+  for (const p of pages) { if (p.status >= 400) continue; const ev = localEvidence(p.url, visibleText(p.text), cc); if (ev) return { state: "available", checkedAt, evidence: ev }; }
+  return out;
+}
+
 // ===== index.js =====
 // Yanju alternatives server (Cloudflare Worker).
 // The app asks for one service by name. This server finds alternatives, filters and ranks them, checks each
-// product's own pricing page, remembers the answers, and returns one simple list. Keys never leave this server.
+// product's own website, remembers the answers, and returns one simple list. Keys never leave this server.
 
 
 const BASE = "https://api.api.sh";
 const DAY = 86400;
-const TTL = { list: 30 * DAY, fresh: 7 * DAY, soft: 7 * DAY, sw: 90 * DAY, slug: 90 * DAY, priceOk: 7 * DAY, priceNo: 2 * DAY, lock: 300 };
-const PAGE_SIZE_SHOWN = 8;            // how many products per page get a price check (each costs one lookup credit)
+const TTL = { list: 30 * DAY, soft: 7 * DAY, sw: 90 * DAY, slug: 90 * DAY, err: 2 * DAY, lock: 300, av: { available: 30 * DAY, unverified: 14 * DAY, unavailable: 90 * DAY, retry: DAY } };
+const WORK_PER_REQUEST = 6;   // products looked at per request (keeps us inside the free plan limit of 50 outside calls)
 const KNOWN_SLUGS = { canva: "canva" }; // only slugs confirmed against the real service; the rest are searched once and remembered
+// When a service is not listed at all (for example a local service), we use a well-known service in the same
+// category as a stand-in, so the person still sees useful alternatives. Names are searched, never guessed as slugs.
+const ANCHORS = { video: "Netflix", music: "Spotify", design: "Canva", ai: "ChatGPT", work: "Microsoft Office", web: "Wix", storage: "Dropbox", learn: "Coursera", security: "NordVPN" };
+// Products that are known to be sold only in certain countries (ISO codes). Nothing in our data sources says where a
+// product is available, so this short list is kept by hand. Everything else is shown, with a note to check the website.
+const REGION_ONLY = { pandora: ["US"], hulu: ["US", "JP"], peacock: ["US"], "sling tv": ["US"], philo: ["US"] };
+const CODE_HOSTS = /(^|\.)(github\.com|gitlab\.com|codeberg\.org|sourceforge\.net|f-droid\.org|play\.google\.com|apps\.apple\.com|microsoft\.com|addons\.mozilla\.org|chromewebstore\.google\.com)$/;
+// Send people to the product's main website. Deep links (web players, app pages, tracking links) often fail on a phone.
+function cleanSite(u) {
+  try {
+    const x = new URL(u); if (x.protocol !== "https:" && x.protocol !== "http:") return null;
+    let host = x.hostname.toLowerCase();
+    if (CODE_HOSTS.test(host)) return "https://" + host + x.pathname.replace(/\/+$/, "");
+    const parts = host.split(".");
+    if (parts.length > 2 && /^(open|play|app|web|listen|go|my|m|get)$/.test(parts[0])) host = parts.slice(1).join(".");
+    return "https://" + host + "/";
+  } catch (e) { return null; }
+}
+const trimRaw = p => ({ slug: p.slug, name: p.name, description: String(p.description || "").slice(0, 300), likes: p.likes, license_cost: p.license_cost,
+  license_model: p.license_model, license: p.license, platforms: p.platforms, categories: (p.categories || []).slice(0, 5), highlights: (p.highlights || []).slice(0, 2), company: p.company });
 
 // ---- tiny cache: KV when available, memory otherwise ------------------------------
 const mem = new Map();
@@ -279,13 +369,13 @@ async function apish(env, route, params, f = fetch) {
 async function resolveSlug(env, c, name, f) {
   const n = norm(name);
   if (KNOWN_SLUGS[n]) return { slug: KNOWN_SLUGS[n], name };
-  const hit = await c.get("slug:" + n);
+  const hit = await c.get("slug:v2:" + n);
   if (hit) return hit.slug ? hit : null;
   const res = await apish(env, "/alternativeto/v1/search", { q: name }, f);
   const items = (res && res.items) || [];
   const pick = items.find(i => norm(i.name) === n) || items.find(i => norm(i.name).startsWith(n)) || null;
-  const out = pick ? { slug: pick.slug, name: pick.name } : { slug: null };
-  await c.put("slug:" + n, out, TTL.slug);
+  const out = pick ? { slug: pick.slug, name: pick.name, raw: trimRaw(pick) } : { slug: null };
+  await c.put("slug:v2:" + n, out, TTL.slug);
   return pick ? out : null;
 }
 
@@ -321,31 +411,28 @@ async function getList(env, c, slug, name, page, f) {
   }
 }
 
-// ---- prices -----------------------------------------------------------------------
-async function priceFor(env, c, slug, f, now) {
-  const hit = await c.get("price:" + slug);
-  if (hit && hit.status === "pending") return hit.at && now - hit.at < TTL.lock * 1000 ? hit : null;
-  return hit;
+// ---- product websites (one lookup credit each, remembered for 90 days and shared by every service) ----
+async function lookupSite(env, c, it, f) {
+  const lock = await c.get("swlock:" + it.slug);
+  if (lock && Date.now() - lock.at < TTL.lock * 1000) return;      // another request is already doing it
+  await c.put("swlock:" + it.slug, { at: Date.now() }, TTL.lock);
+  try {
+    const d = await apish(env, "/alternativeto/v1/software", { slug: it.slug }, f);
+    const off = ((d && d.links) || []).find(l => l && l.type === "Official");
+    await c.put("sw:v2:" + it.slug, { website: off ? off.url : (d && d.company && d.company.url) || null }, TTL.sw);
+  } catch (e) { await c.put("sw:v2:" + it.slug, { website: null, error: e.code || "error" }, TTL.err); }
 }
 
-async function enrichOne(env, c, it, f) {
-  const now = Date.now();
-  await c.put("price:" + it.slug, { status: "pending", at: now }, TTL.lock);
-  let result = { status: "unavailable", pricingUrl: null, plans: [], checkedAt: new Date().toISOString().slice(0, 10) };
-  try {
-    let sw = await c.get("sw:" + it.slug);
-    if (!sw) {
-      const d = await apish(env, "/alternativeto/v1/software", { slug: it.slug }, f);
-      const off = ((d && d.links) || []).find(l => l && l.type === "Official");
-      sw = { website: off ? off.url : (d && d.company && d.company.url) || null };
-      await c.put("sw:" + it.slug, sw, TTL.sw);
-    }
-    if (sw.website) result = Object.assign(await lookupPricing(sw.website, f), { website: sw.website });
-    else result.website = null;
-  } catch (e) { result.error = e.code || "error"; }
-  const ok = result.status === "verified";
-  await c.put("price:" + it.slug, result, ok ? TTL.priceOk : TTL.priceNo);
-  return result;
+// Looks up the website (if needed), then checks the product's own site for evidence about this country.
+async function workOn(env, c, it, country, f) {
+  let sw = await c.get("sw:v2:" + it.slug);
+  if (!sw) { await lookupSite(env, c, it, f); sw = await c.get("sw:v2:" + it.slug); }
+  const site = sw && sw.website ? cleanSite(sw.website) : null;
+  if (!site || !country) return;
+  const key = `av:v1:${country}:${it.slug}`;
+  if (await c.get(key)) return;
+  const r = await probeAvailability(site, country, f);
+  await c.put(key, r, r.error ? TTL.av.retry : TTL.av[r.state]);
 }
 
 // ---- request handler ----------------------------------------------------------------
@@ -370,23 +457,33 @@ async function handle(req, env, ctx, f = fetch) {
 
   const c = cache(env), now = Date.now();
   try {
-    const match = await resolveSlug(env, c, service, f);
-    if (!match) return json({ ok: true, service, matched: null, page, hasMore: false, items: [], pricingPending: false }, 200, cors);
+    const cat = (url.searchParams.get("cat") || "").toLowerCase().slice(0, 20);
+    let match = await resolveSlug(env, c, service, f), fallback = false;
+    if (!match && ANCHORS[cat]) { const a = await resolveSlug(env, c, ANCHORS[cat], f); if (a) { match = a; fallback = true; } }
+    if (!match) return json({ ok: true, service, matched: null, page, hasMore: false, items: [], pending: false }, 200, cors);
     const list = await getList(env, c, match.slug, match.name || service, page, f);
-    const shown = list.items.slice(0, 12);
-    const out = []; const toEnrich = [];
-    for (const it of shown) {
-      const p = await priceFor(env, c, it.slug, f, now);
-      const idx = out.length;
-      if (!p && idx < PAGE_SIZE_SHOWN) toEnrich.push(it);
-      const price = p ? (p.status === "pending" ? { status: "pending" } : { status: p.status, plans: p.plans || [], pricingUrl: p.pricingUrl || null, checkedAt: p.checkedAt, region: p.region || null })
-        : idx < PAGE_SIZE_SHOWN ? { status: "pending" } : { status: "unavailable", plans: [], pricingUrl: null };
-      out.push(publicItem(it, { website: p && p.website ? p.website : null, price }));
+    let pool = list.items;
+    if (fallback && page === 1 && match.raw) {   // the stand-in itself is a fair alternative to the service we could not find
+      pool = rank(filterItems(pool.concat([normalizeItem(match.raw, list.primary)]), service));
     }
-    if (toEnrich.length && ctx && ctx.waitUntil) ctx.waitUntil(Promise.allSettled(toEnrich.map(it => enrichOne(env, c, it, f))));
-    else if (toEnrich.length) await Promise.allSettled(toEnrich.map(it => enrichOne(env, c, it, f)));
-    return json({ ok: true, service, matched: match, page, hasMore: list.hasMore, stale: list.stale, items: out,
-      pricingPending: out.some(i => i.price.status === "pending") }, 200, cors);
+    const country = String((req.cf && req.cf.country) || req.headers.get("cf-ipcountry") || "").toUpperCase();
+    const here = x => { const only = REGION_ONLY[norm(x.name)]; return !(only && /^[A-Z]{2}$/.test(country) && !only.includes(country)); };
+    const shown = pool.filter(here).slice(0, 12);
+    const known = /^[A-Z]{2}$/.test(country);
+    const out = [], todo = [];
+    for (const it of shown) {
+      const sw = await c.get("sw:v2:" + it.slug);
+      const av = known && sw && sw.website ? await c.get(`av:v1:${country}:${it.slug}`) : null;
+      if (av && av.state === "unavailable") continue;               // confirmed not offered here: never recommended
+      const needs = !sw || (known && sw.website && !av);
+      if (needs) todo.push(it);
+      out.push(publicItem(it, { website: sw && sw.website ? cleanSite(sw.website) : null, availability: av ? av.state : "unverified" }));
+    }
+    const batch = todo.slice(0, WORK_PER_REQUEST).map(it => workOn(env, c, it, known ? country : "", f));
+    if (batch.length && ctx && ctx.waitUntil) ctx.waitUntil(Promise.allSettled(batch));
+    else if (batch.length) await Promise.allSettled(batch);
+    return json({ ok: true, service, matched: { slug: match.slug, name: match.name }, fallback, country: country || null, page, hasMore: list.hasMore, stale: list.stale, items: out,
+      pending: todo.length > 0 }, 200, cors);
   } catch (e) {
     const reason = e.code === "limit" ? "busy" : e.code === "no_key" ? "not_configured" : "unavailable";
     return json({ ok: false, reason }, reason === "not_configured" ? 503 : 502, cors);
