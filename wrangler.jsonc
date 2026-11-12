@@ -1,0 +1,10 @@
+{
+  "name": "yanju-alternatives",
+  "main": "worker-single.js",
+  "compatibility_date": "2025-01-01",
+  "observability": { "enabled": true },
+  "kv_namespaces": [
+    { "binding": "ALT_KV", "id": "PASTE_KV_NAMESPACE_ID_HERE" }
+  ],
+  "vars": { "ALLOWED_ORIGINS": "*" }
+}
