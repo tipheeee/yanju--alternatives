@@ -337,6 +337,14 @@ function cleanSite(u) {
     return "https://" + host + "/";
   } catch (e) { return null; }
 }
+// Official pricing pages that follow a country pattern. Only addresses we have been given or checked go here.
+const PRICING_PAGES = { "spotify.com": "https://www.spotify.com/{cc}/premium/" };
+function pricingPage(site, cc) {
+  try {
+    const tpl = PRICING_PAGES[new URL(site).hostname.toLowerCase().replace(/^www\./, "")];
+    return tpl && /^[A-Z]{2}$/.test(cc) ? tpl.replace("{cc}", cc.toLowerCase()) : null;
+  } catch (e) { return null; }
+}
 const trimRaw = p => ({ slug: p.slug, name: p.name, description: String(p.description || "").slice(0, 300), likes: p.likes, license_cost: p.license_cost,
   license_model: p.license_model, license: p.license, platforms: p.platforms, categories: (p.categories || []).slice(0, 5), highlights: (p.highlights || []).slice(0, 2), company: p.company });
 
@@ -477,7 +485,8 @@ async function handle(req, env, ctx, f = fetch) {
       if (av && av.state === "unavailable") continue;               // confirmed not offered here: never recommended
       const needs = !sw || (known && sw.website && !av);
       if (needs) todo.push(it);
-      out.push(publicItem(it, { website: sw && sw.website ? cleanSite(sw.website) : null, availability: av ? av.state : "unverified" }));
+      const website = sw && sw.website ? cleanSite(sw.website) : null;
+      out.push(publicItem(it, { website, pricingUrl: website && known ? pricingPage(website, country) : null, availability: av ? av.state : "unverified" }));
     }
     const batch = todo.slice(0, WORK_PER_REQUEST).map(it => workOn(env, c, it, known ? country : "", f));
     if (batch.length && ctx && ctx.waitUntil) ctx.waitUntil(Promise.allSettled(batch));
