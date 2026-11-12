@@ -4,7 +4,7 @@
   "compatibility_date": "2025-01-01",
   "observability": { "enabled": true },
   "kv_namespaces": [
-    { "binding": "ALT_KV", "id": "PASTE_KV_NAMESPACE_ID_HERE" }
+    { "binding": "ALT_KV", "id": "541434c6bcf147d18180f5c9d83f0fba" }
   ],
   "vars": { "ALLOWED_ORIGINS": "*" }
 }
