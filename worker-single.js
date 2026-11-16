@@ -1,5 +1,6 @@
 // Yanju alternatives server, single file for pasting or uploading.
 // Needs: a KV binding named ALT_KV (recommended) and a secret named APISH_KEY.
+// Optional daily keep-alive for Supabase: variables SUPABASE_URL and SUPABASE_KEY and a cron trigger.
 // ===== core.js =====
 // Pure helpers: turning raw AlternativeTo data into simple, safe recommendations.
 // No network and no storage in this file, so it is easy to test.
@@ -499,4 +500,14 @@ async function handle(req, env, ctx, f = fetch) {
   }
 }
 
-export default { fetch: (req, env, ctx) => handle(req, env, ctx) };
+// Once a day, makes one small read from the Supabase database so a free project is not paused for inactivity.
+// SUPABASE_URL and SUPABASE_KEY are the same public values the app already uses. Nothing secret is needed.
+async function keepAlive(env, f = fetch) {
+  if (!env.SUPABASE_URL || !env.SUPABASE_KEY) return { ok: false, skipped: true };
+  try {
+    const r = await f(String(env.SUPABASE_URL).replace(/\/+$/, "") + "/rest/v1/keep_alive?select=id&limit=1", { headers: { apikey: env.SUPABASE_KEY, authorization: "Bearer " + env.SUPABASE_KEY }, signal: AbortSignal.timeout(15000) });
+    return { ok: r.ok, status: r.status };
+  } catch (e) { return { ok: false }; }
+}
+
+export default { fetch: (req, env, ctx) => handle(req, env, ctx), scheduled: (event, env, ctx) => ctx.waitUntil(keepAlive(env)) };
