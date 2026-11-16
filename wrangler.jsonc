@@ -6,5 +6,9 @@
   "kv_namespaces": [
     { "binding": "ALT_KV", "id": "541434c6bcf147d18180f5c9d83f0fba" }
   ],
-  "vars": { "ALLOWED_ORIGINS": "*" }
+  "vars": { "ALLOWED_ORIGINS": "*",
+"SUPABASE_URL": "https://utiumcvozfohydmqalwo.supabase.co",
+"SUPABASE_KEY": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InV0aXVtY3ZvemZvaHlkbXFhbHdvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTQ1OTk5MTMsImV4cCI6MjExMDE3NTkxM30.emzJF93JqB6ZeV6WNW2QsvYvjh25XWfi3A9jI3yknMk"
+  },
+  "triggers": { "crons": ["0 6 * * *"] }
 }
